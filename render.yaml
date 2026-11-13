@@ -1,9 +1,0 @@
-services:
-  - type: web
-    name: book-scraper
-    runtime: docker
-    plan: free
-    envVars:
-      - key: PORT
-        value: 10000
-
