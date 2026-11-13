@@ -1,17 +1,25 @@
 import io
+import sys
+import asyncio
 import time
-import urllib.request
 from PIL import Image
+import streamlit as st
 from playwright.sync_api import sync_playwright
 
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-def download_scribd_doc(url: str, output_pdf: str = "document.pdf"):
-    print(f"Connecting to: {url}")
+
+def extract_document_to_pdf(
+    url: str, headless: bool, scale_factor: int, status_container
+) -> io.BytesIO | None:
+    status_container.write(f"Connecting to: `{url}`...")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(headless=headless)
         context = browser.new_context(
-            viewport={"width": 1400, "height": 1800},
+            viewport={"width": 1920, "height": 2600},
+            device_scale_factor=scale_factor,
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -19,27 +27,22 @@ def download_scribd_doc(url: str, output_pdf: str = "document.pdf"):
             ),
         )
         page = context.new_page()
-
-        # Use 'domcontentloaded' instead of 'networkidle' to avoid timeouts
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-        # Wait for the first page div to appear in the DOM
-        print("Waiting for page container (#page1) to mount...")
+        status_container.write("Waiting for page containers (`#page1`) to mount...")
         try:
             page.wait_for_selector('div[id^="page"]', timeout=20000)
         except Exception:
-            print(
-                "Warning: Initial page div not detected immediately. Continuing anyway..."
+            status_container.write(
+                "⚠️ Initial page div not detected immediately. Continuing anyway..."
             )
 
         time.sleep(3)
 
         # -------------------------------------------------------------
-        # STEP 1: Scroll all the way to the end to trigger lazy loading
+        # STEP 1: Scroll through document to discover all page IDs
         # -------------------------------------------------------------
-        print("Scrolling through the document to trigger full page hydration...")
-
-        # Find the actual scrollable element or fallback to window
+        status_container.write("Scrolling document to register all page containers...")
         scroll_script = """() => {
             const getScrollableContainer = () => {
                 const candidates = document.querySelectorAll('div, section, main');
@@ -54,13 +57,13 @@ def download_scribd_doc(url: str, output_pdf: str = "document.pdf"):
 
             const container = getScrollableContainer();
             if (container === window) {
-                window.scrollBy(0, window.innerHeight * 0.9);
+                window.scrollBy(0, window.innerHeight * 0.85);
                 return {
                     current: window.scrollY + window.innerHeight,
                     total: document.documentElement.scrollHeight
                 };
             } else {
-                container.scrollTop += container.clientHeight * 0.9;
+                container.scrollTop += container.clientHeight * 0.85;
                 return {
                     current: container.scrollTop + container.clientHeight,
                     total: container.scrollHeight
@@ -68,41 +71,28 @@ def download_scribd_doc(url: str, output_pdf: str = "document.pdf"):
             }
         }"""
 
-        last_total = 0
         stuck_count = 0
-        max_steps = 60
-
-        for step in range(max_steps):
+        for _ in range(80):
             metrics = page.evaluate(scroll_script)
-            time.sleep(1.0)
-
-            # Check if we reached the bottom or content stopped growing
+            time.sleep(0.5)
             if metrics["current"] >= metrics["total"] - 50:
                 stuck_count += 1
                 if stuck_count >= 3:
-                    print("Reached end of document.")
                     break
             else:
                 stuck_count = 0
 
-            last_total = metrics["total"]
-
-        print("Finished scrolling. Allowing assets to settle...")
-        time.sleep(3)
-
-        # -------------------------------------------------------------
-        # STEP 2: Retrieve all matching page divs sorted numerically
-        # -------------------------------------------------------------
+        # Collect unique sorted page IDs (#page1, #page2, ...)
         page_ids = page.evaluate("""() => {
             const divs = document.querySelectorAll('div[id^="page"]');
-            const ids = [];
+            const idSet = new Set();
             const regex = /^page(\\d+)$/;
             divs.forEach(d => {
                 if (regex.test(d.id)) {
-                    ids.push(d.id);
+                    idSet.add(d.id);
                 }
             });
-            return ids.sort((a, b) => {
+            return Array.from(idSet).sort((a, b) => {
                 const nA = parseInt(a.replace('page', ''), 10);
                 const nB = parseInt(b.replace('page', ''), 10);
                 return nA - nB;
@@ -110,92 +100,252 @@ def download_scribd_doc(url: str, output_pdf: str = "document.pdf"):
         }""")
 
         if not page_ids:
-            print("Error: No divs matching '#page1, #page2, ...' found.")
             browser.close()
-            return
-
-        print(f"Found {len(page_ids)} page container(s): {page_ids}")
+            raise RuntimeError(
+                "No page containers matching '#page1, #page2, ...' were found."
+            )
 
         # -------------------------------------------------------------
-        # STEP 3: Extract and download images for each page
+        # STEP 2: Strip headers/sidebars & remove duplicate hidden thumbnails
+        # -------------------------------------------------------------
+        status_container.write(
+            "Cleaning up site headers, duplicate thumbnails, and overlays..."
+        )
+        page.evaluate("""() => {
+            // 1. Remove duplicate hidden thumbnail elements that share #pageX IDs
+            const seen = new Set();
+            document.querySelectorAll('div[id^="page"]').forEach(el => {
+                const rect = el.getBoundingClientRect();
+                // Keep only the full-sized reader page (width > 300px)
+                if (rect.width < 300 || seen.has(el.id)) {
+                    el.remove();
+                } else {
+                    seen.add(el.id);
+                }
+            });
+
+            // 2. Remove headers, toolbars, sidebars, and promos
+            const selectorsToRemove = [
+                'header', 'nav', 'aside',
+                '[data-testid="global-header"]',
+                '[class*="GlobalHeader"]',
+                '[class*="DocumentToolbar"]',
+                '[class*="Toolbar"]',
+                '[class*="Sidebar"]',
+                '[class*="PromoBanner"]',
+                '[class*="Paywall"]',
+                '[id*="header"]',
+                '[id*="toolbar"]'
+            ];
+            selectorsToRemove.forEach(sel => {
+                document.querySelectorAll(sel).forEach(el => {
+                    if (!el.querySelector('div[id^="page"]')) {
+                        el.remove();
+                    }
+                });
+            });
+
+            // 3. Remove any remaining fixed/sticky elements
+            document.querySelectorAll('*').forEach(el => {
+                const style = window.getComputedStyle(el);
+                if ((style.position === 'fixed' || style.position === 'sticky') && !el.querySelector('div[id^="page"]')) {
+                    el.remove();
+                }
+            });
+
+            // 4. Remove blur filters
+            document.querySelectorAll('[class*="blurred"], [style*="blur"]').forEach(el => {
+                el.style.filter = 'none';
+                el.style.webkitFilter = 'none';
+                el.style.opacity = '1';
+            });
+
+            // 5. Widen ancestor containers so right-side music staves never clip
+            const firstPage = document.getElementById('page1');
+            if (firstPage) {
+                let parent = firstPage.parentElement;
+                while (parent && parent !== document.body) {
+                    parent.style.maxWidth = 'none';
+                    parent.style.width = '100%';
+                    parent.style.overflow = 'visible';
+                    parent.style.marginLeft = '0';
+                    parent.style.paddingLeft = '20px';
+                    parent = parent.parentElement;
+                }
+            }
+        }""")
+
+        status_container.write(
+            f"Found **{len(page_ids)}** pages. Capturing full pages..."
+        )
+
+        # -------------------------------------------------------------
+        # STEP 3: Hydrate & clip-capture exact bounding box of each #pageX
         # -------------------------------------------------------------
         collected_images = []
+        progress_bar = st.progress(0, text="Capturing pages...")
 
-        for pid in page_ids:
-            print(f"Processing #{pid}...")
-            container = page.locator(f"#{pid}")
-            container.scroll_into_view_if_needed()
-            time.sleep(0.5)
+        for idx, pid in enumerate(page_ids):
+            progress_bar.progress(
+                (idx + 1) / len(page_ids),
+                text=f"Capturing #{pid} ({idx + 1}/{len(page_ids)})...",
+            )
 
-            img_bytes = None
-            img_locator = container.locator("img")
+            # Scroll #pageX to the top-left of the viewport to trigger lazy asset hydration
+            page.evaluate(f"""() => {{
+                const el = document.getElementById('{pid}');
+                if (el) {{
+                    el.scrollIntoView({{ behavior: 'instant', block: 'start', inline: 'start' }});
+                }}
+            }}""")
+            time.sleep(1.1)
 
-            if img_locator.count() > 0:
-                first_img = img_locator.first
-                src = first_img.get_attribute("src") or ""
+            # Calculate the exact unclipped bounding box of #pageX including inner layers
+            clip_box = page.evaluate(f"""() => {{
+                const el = document.getElementById('{pid}');
+                if (!el) return null;
 
-                if src.startswith("http://") or src.startswith("https://"):
-                    try:
-                        req = urllib.request.Request(
-                            src,
-                            headers={
-                                "User-Agent": (
-                                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                    "Chrome/124.0.0.0 Safari/537.36"
-                                ),
-                                "Referer": "https://www.scribd.com/",
-                            },
-                        )
-                        with urllib.request.urlopen(req, timeout=15) as response:
-                            img_bytes = response.read()
-                    except Exception as e:
-                        print(
-                            f"Direct download failed for {src}: {e}. Falling back to element screenshot."
-                        )
+                el.style.overflow = 'visible';
+                const elRect = el.getBoundingClientRect();
+                let minLeft = elRect.left;
+                let minTop = elRect.top;
+                let maxRight = elRect.right;
+                let maxBottom = elRect.bottom;
 
-                # Fallback to element screenshot if URL download failed
-                if not img_bytes:
-                    try:
-                        img_bytes = first_img.screenshot()
-                    except Exception:
-                        img_bytes = None
+                el.querySelectorAll('div, img').forEach(child => {{
+                    const r = child.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) {{
+                        if (r.left < minLeft) minLeft = r.left;
+                        if (r.top < minTop) minTop = r.top;
+                        if (r.right > maxRight) maxRight = r.right;
+                        if (r.bottom > maxBottom) maxBottom = r.bottom;
+                    }}
+                }});
 
-            # Fallback to container screenshot if no <img> tag or it failed
-            if not img_bytes:
-                img_bytes = container.screenshot()
+                const width = Math.ceil(maxRight - minLeft);
+                const height = Math.ceil(maxBottom - minTop);
+
+                if (width <= 0 || height <= 0) return null;
+
+                return {{
+                    x: Math.max(0, Math.floor(minLeft)),
+                    y: Math.max(0, Math.floor(minTop)),
+                    width: width,
+                    height: height
+                }};
+            }}""")
+
+            if not clip_box:
+                status_container.write(f"⚠️ Skipping `#{pid}` (not rendered in DOM).")
+                continue
 
             try:
+                # Using page.screenshot(clip=...) avoids locator visibility/stability timeouts
+                # and captures the exact union bounding box of the staves + text layer
+                img_bytes = page.screenshot(
+                    type="png",
+                    clip=clip_box,
+                    animations="disabled",
+                    timeout=15000,
+                )
                 pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
                 collected_images.append(pil_img)
             except Exception as e:
-                print(f"Could not parse image for #{pid}: {e}")
+                status_container.write(f"⚠️ Failed to capture `#{pid}`: {e}")
 
         browser.close()
+        progress_bar.empty()
 
         # -------------------------------------------------------------
-        # STEP 4: Compile downloaded images into PDF
+        # STEP 4: Compile captured page images into PDF
         # -------------------------------------------------------------
-        if collected_images:
-            print(
-                f"\nCompiling {len(collected_images)} image(s) into '{output_pdf}'..."
-            )
-            first_page = collected_images[0]
-            other_pages = collected_images[1:]
+        if not collected_images:
+            return None
 
-            first_page.save(
-                output_pdf,
-                save_all=True,
-                append_images=other_pages,
-                resolution=150.0,
-            )
-            print(f"Done. PDF saved successfully as: {output_pdf}")
-        else:
-            print("No images were extracted. PDF creation aborted.")
+        status_container.write(f"Compiling {len(collected_images)} page(s) into PDF...")
+        pdf_buffer = io.BytesIO()
+        first_page = collected_images[0]
+        other_pages = collected_images[1:]
+
+        first_page.save(
+            pdf_buffer,
+            format="PDF",
+            save_all=True,
+            append_images=other_pages,
+            resolution=150.0 * scale_factor,
+        )
+        pdf_buffer.seek(0)
+        return pdf_buffer
 
 
-if __name__ == "__main__":
-    scribd_url = "https://www.scribd.com/document/819012042/Rock-Pop-Drums-Session-Skills-Initial-Grade-2"
-    output_path = "Rock_Pop_Drums_Session_Skills.pdf"
+# -------------------------------------------------------------
+# STREAMLIT UI
+# -------------------------------------------------------------
+st.set_page_config(
+    page_title="Document to PDF Converter", page_icon="📄", layout="centered"
+)
 
-    download_scribd_doc(scribd_url, output_path)
+st.title("📄 Full-Page Document Capture to PDF")
+st.markdown(
+    "Captures each `#pageX` container cleanly with full musical staves and text layers."
+)
+
+url_input = st.text_input(
+    "Document URL",
+    placeholder="https://www.scribd.com/document/...",
+)
+
+col1, col2, col3 = st.columns([2, 1, 1])
+with col1:
+    filename_input = st.text_input("Output Filename", value="document.pdf")
+with col2:
+    scale_factor = st.selectbox(
+        "Quality (DPI Scale)",
+        options=[1, 2, 3],
+        index=1,
+        help="2x gives crisp text and sheet music.",
+    )
+with col3:
+    st.write("")
+    st.write("")
+    headless_mode = st.checkbox("Headless", value=True)
+
+if st.button("Generate PDF", type="primary", use_container_width=True):
+    clean_url = url_input.strip()
+    if not clean_url:
+        st.error("Please enter a valid URL.")
+    else:
+        output_name = filename_input.strip() or "document.pdf"
+        if not output_name.lower().endswith(".pdf"):
+            output_name += ".pdf"
+
+        try:
+            with st.status("Running extraction...", expanded=True) as status:
+                pdf_data = extract_document_to_pdf(
+                    clean_url, headless_mode, scale_factor, status
+                )
+
+                if pdf_data:
+                    status.update(
+                        label="PDF compiled successfully!",
+                        state="complete",
+                        expanded=False,
+                    )
+                    st.session_state["pdf_bytes"] = pdf_data.getvalue()
+                    st.session_state["pdf_filename"] = output_name
+                else:
+                    status.update(label="Extraction failed.", state="error")
+                    st.error("No pages were captured. PDF creation aborted.")
+
+        except Exception as e:
+            st.error(f"An error occurred: {e}")
+
+if "pdf_bytes" in st.session_state:
+    st.success(f"Ready: **{st.session_state['pdf_filename']}**")
+    st.download_button(
+        label="⬇️ Download PDF",
+        data=st.session_state["pdf_bytes"],
+        file_name=st.session_state["pdf_filename"],
+        mime="application/pdf",
+        use_container_width=True,
+    )
