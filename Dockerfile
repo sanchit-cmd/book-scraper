@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
-    PORT=10000 \
+    PORT=8080 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # Install uv for fast dependency management
@@ -31,9 +31,9 @@ RUN playwright install --with-deps chromium && \
 # Copy the rest of the application code
 COPY . .
 
-# Expose Render's default port
-EXPOSE 10000
+# Expose standard web service port
+EXPOSE 8080
 
-# Run Streamlit, dynamically binding to Render's $PORT environment variable
-CMD ["sh", "-c", "streamlit run main.py --server.port=${PORT:-10000} --server.address=0.0.0.0"]
+# Run Streamlit, dynamically binding to $PORT environment variable (defaults to 8080)
+CMD ["sh", "-c", "streamlit run main.py --server.port=${PORT:-8080} --server.address=0.0.0.0"]
 

@@ -3,8 +3,19 @@ import os
 import sys
 import asyncio
 import time
+import subprocess
 from PIL import Image
 import streamlit as st
+
+@st.cache_resource(show_spinner=False)
+def ensure_playwright_installed():
+    try:
+        subprocess.run(["playwright", "install", "chromium"], check=False)
+    except Exception:
+        pass
+
+ensure_playwright_installed()
+
 from playwright.sync_api import sync_playwright
 
 if sys.platform == "win32":
