@@ -9,6 +9,9 @@ import streamlit as st
 
 @st.cache_resource(show_spinner=False)
 def ensure_playwright_installed():
+    # If pre-installed in Docker container (/ms-playwright exists), skip
+    if os.path.exists("/ms-playwright"):
+        return
     try:
         subprocess.run(["playwright", "install", "chromium"], check=False)
     except Exception:
