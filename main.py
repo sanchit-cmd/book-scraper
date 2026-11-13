@@ -1,4 +1,5 @@
 import io
+import os
 import sys
 import asyncio
 import time
@@ -16,7 +17,15 @@ def extract_document_to_pdf(
     status_container.write(f"Connecting to: `{url}`...")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
+        browser = p.chromium.launch(
+            headless=headless,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
         context = browser.new_context(
             viewport={"width": 1600, "height": 2400},
             device_scale_factor=scale_factor,
@@ -253,7 +262,15 @@ with col2:
 with col3:
     st.write("")
     st.write("")
-    headless_mode = st.checkbox("Headless", value=True)
+    has_display = bool(os.environ.get("DISPLAY"))
+    headless_mode = st.checkbox(
+        "Headless",
+        value=True,
+        disabled=not has_display,
+        help="Headless mode is required in Docker or cloud environments without a display."
+        if not has_display
+        else "Run browser in background without opening a window.",
+    )
 
 if st.button("Generate PDF", type="primary", use_container_width=True):
     clean_url = url_input.strip()
