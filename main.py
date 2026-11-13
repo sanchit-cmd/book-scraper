@@ -18,7 +18,7 @@ def extract_document_to_pdf(
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         context = browser.new_context(
-            viewport={"width": 1920, "height": 2600},
+            viewport={"width": 1600, "height": 2400},
             device_scale_factor=scale_factor,
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -40,9 +40,9 @@ def extract_document_to_pdf(
         time.sleep(3)
 
         # -------------------------------------------------------------
-        # STEP 1: Scroll through document to discover all page IDs
+        # STEP 1: Scroll through document to register all page IDs
         # -------------------------------------------------------------
-        status_container.write("Scrolling document to register all page containers...")
+        status_container.write("Scrolling document to register all pages...")
         scroll_script = """() => {
             const getScrollableContainer = () => {
                 const candidates = document.querySelectorAll('div, section, main');
@@ -82,7 +82,6 @@ def extract_document_to_pdf(
             else:
                 stuck_count = 0
 
-        # Collect unique sorted page IDs (#page1, #page2, ...)
         page_ids = page.evaluate("""() => {
             const divs = document.querySelectorAll('div[id^="page"]');
             const idSet = new Set();
@@ -106,81 +105,23 @@ def extract_document_to_pdf(
             )
 
         # -------------------------------------------------------------
-        # STEP 2: Strip headers/sidebars & remove duplicate hidden thumbnails
+        # STEP 2: Hide only fixed/sticky top bars so they don't cover pages
         # -------------------------------------------------------------
-        status_container.write(
-            "Cleaning up site headers, duplicate thumbnails, and overlays..."
-        )
         page.evaluate("""() => {
-            // 1. Remove duplicate hidden thumbnail elements that share #pageX IDs
-            const seen = new Set();
-            document.querySelectorAll('div[id^="page"]').forEach(el => {
-                const rect = el.getBoundingClientRect();
-                // Keep only the full-sized reader page (width > 300px)
-                if (rect.width < 300 || seen.has(el.id)) {
-                    el.remove();
-                } else {
-                    seen.add(el.id);
-                }
-            });
-
-            // 2. Remove headers, toolbars, sidebars, and promos
-            const selectorsToRemove = [
-                'header', 'nav', 'aside',
-                '[data-testid="global-header"]',
-                '[class*="GlobalHeader"]',
-                '[class*="DocumentToolbar"]',
-                '[class*="Toolbar"]',
-                '[class*="Sidebar"]',
-                '[class*="PromoBanner"]',
-                '[class*="Paywall"]',
-                '[id*="header"]',
-                '[id*="toolbar"]'
-            ];
-            selectorsToRemove.forEach(sel => {
-                document.querySelectorAll(sel).forEach(el => {
-                    if (!el.querySelector('div[id^="page"]')) {
-                        el.remove();
-                    }
-                });
-            });
-
-            // 3. Remove any remaining fixed/sticky elements
             document.querySelectorAll('*').forEach(el => {
                 const style = window.getComputedStyle(el);
                 if ((style.position === 'fixed' || style.position === 'sticky') && !el.querySelector('div[id^="page"]')) {
-                    el.remove();
+                    el.style.display = 'none';
                 }
             });
-
-            // 4. Remove blur filters
-            document.querySelectorAll('[class*="blurred"], [style*="blur"]').forEach(el => {
-                el.style.filter = 'none';
-                el.style.webkitFilter = 'none';
-                el.style.opacity = '1';
-            });
-
-            // 5. Widen ancestor containers so right-side music staves never clip
-            const firstPage = document.getElementById('page1');
-            if (firstPage) {
-                let parent = firstPage.parentElement;
-                while (parent && parent !== document.body) {
-                    parent.style.maxWidth = 'none';
-                    parent.style.width = '100%';
-                    parent.style.overflow = 'visible';
-                    parent.style.marginLeft = '0';
-                    parent.style.paddingLeft = '20px';
-                    parent = parent.parentElement;
-                }
-            }
         }""")
 
         status_container.write(
-            f"Found **{len(page_ids)}** pages. Capturing full pages..."
+            f"Found **{len(page_ids)}** pages. Capturing exact container snapshots..."
         )
 
         # -------------------------------------------------------------
-        # STEP 3: Hydrate & clip-capture exact bounding box of each #pageX
+        # STEP 3: Scroll to each #pageX, measure its exact rect, snapshot
         # -------------------------------------------------------------
         collected_images = []
         progress_bar = st.progress(0, text="Capturing pages...")
@@ -191,57 +132,61 @@ def extract_document_to_pdf(
                 text=f"Capturing #{pid} ({idx + 1}/{len(page_ids)})...",
             )
 
-            # Scroll #pageX to the top-left of the viewport to trigger lazy asset hydration
-            page.evaluate(f"""() => {{
-                const el = document.getElementById('{pid}');
-                if (el) {{
-                    el.scrollIntoView({{ behavior: 'instant', block: 'start', inline: 'start' }});
-                }}
-            }}""")
-            time.sleep(1.1)
+            # Scroll the full-size #pid container into the center of the viewport
+            found = page.evaluate(f"""() => {{
+                const matches = Array.from(document.querySelectorAll('div[id="{pid}"]'));
+                if (!matches.length) return false;
 
-            # Calculate the exact unclipped bounding box of #pageX including inner layers
-            clip_box = page.evaluate(f"""() => {{
-                const el = document.getElementById('{pid}');
-                if (!el) return null;
-
-                el.style.overflow = 'visible';
-                const elRect = el.getBoundingClientRect();
-                let minLeft = elRect.left;
-                let minTop = elRect.top;
-                let maxRight = elRect.right;
-                let maxBottom = elRect.bottom;
-
-                el.querySelectorAll('div, img').forEach(child => {{
-                    const r = child.getBoundingClientRect();
-                    if (r.width > 0 && r.height > 0) {{
-                        if (r.left < minLeft) minLeft = r.left;
-                        if (r.top < minTop) minTop = r.top;
-                        if (r.right > maxRight) maxRight = r.right;
-                        if (r.bottom > maxBottom) maxBottom = r.bottom;
+                let target = matches[0];
+                let bestArea = 0;
+                for (const el of matches) {{
+                    const r = el.getBoundingClientRect();
+                    if (r.width * r.height > bestArea) {{
+                        bestArea = r.width * r.height;
+                        target = el;
                     }}
-                }});
+                }}
 
-                const width = Math.ceil(maxRight - minLeft);
-                const height = Math.ceil(maxBottom - minTop);
+                target.scrollIntoView({{ behavior: 'instant', block: 'center', inline: 'center' }});
+                return true;
+            }}""")
 
-                if (width <= 0 || height <= 0) return null;
+            if not found:
+                status_container.write(f"⚠️ Skipping `#{pid}` (not found).")
+                continue
+
+            # Allow lazy-loaded image & text layer inside #pid to finish rendering
+            time.sleep(1.0)
+
+            # Read the exact rendered bounding box of #pid without modifying its CSS
+            clip_box = page.evaluate(f"""() => {{
+                const matches = Array.from(document.querySelectorAll('div[id="{pid}"]'));
+                let target = matches[0];
+                let bestArea = 0;
+                for (const el of matches) {{
+                    const r = el.getBoundingClientRect();
+                    if (r.width * r.height > bestArea) {{
+                        bestArea = r.width * r.height;
+                        target = el;
+                    }}
+                }}
+
+                const rect = target.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) return null;
 
                 return {{
-                    x: Math.max(0, Math.floor(minLeft)),
-                    y: Math.max(0, Math.floor(minTop)),
-                    width: width,
-                    height: height
+                    x: Math.max(0, Math.round(rect.left)),
+                    y: Math.max(0, Math.round(rect.top)),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height)
                 }};
             }}""")
 
             if not clip_box:
-                status_container.write(f"⚠️ Skipping `#{pid}` (not rendered in DOM).")
+                status_container.write(f"⚠️ Skipping `#{pid}` (empty dimensions).")
                 continue
 
             try:
-                # Using page.screenshot(clip=...) avoids locator visibility/stability timeouts
-                # and captures the exact union bounding box of the staves + text layer
                 img_bytes = page.screenshot(
                     type="png",
                     clip=clip_box,
@@ -257,7 +202,7 @@ def extract_document_to_pdf(
         progress_bar.empty()
 
         # -------------------------------------------------------------
-        # STEP 4: Compile captured page images into PDF
+        # STEP 4: Compile captured snapshots into PDF
         # -------------------------------------------------------------
         if not collected_images:
             return None
@@ -285,9 +230,9 @@ st.set_page_config(
     page_title="Document to PDF Converter", page_icon="📄", layout="centered"
 )
 
-st.title("📄 Full-Page Document Capture to PDF")
+st.title("📄 Document Page Snapshot to PDF")
 st.markdown(
-    "Captures each `#pageX` container cleanly with full musical staves and text layers."
+    "Captures the exact rendered bounding box of each `#pageX` container into a PDF."
 )
 
 url_input = st.text_input(
